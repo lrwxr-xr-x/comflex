@@ -25,12 +25,18 @@
 #include "flex.h"
 #include "pm.h"
 
+#define XTAL (26000000) // 26 MHz
+#define UPPER(a, b, c)  ((((a) - (b) + ((c) / 2)) / (c)) * (c))
+#define LOWER(a, b, c)  ((((a) + (b)) / (c)) * (c))
+
+typedef enum { TWOFSK = 0, GFSK = 1, BLANK1 = 2, ONOFFKEY = 3, FOURFSK = 4, BLANK2 = 5, BLANK3 = 6, MSK = 7 } modulation;
+
 /* globals */
 __bit sleepy;
 static volatile u8 rxdone = 0;
 __xdata DMA_DESC dmaConfig;
 
-#define LEN 8
+#define LEN 12
 __xdata u8 rxbuf[LEN];
 
 void setup_dma_rx()
@@ -40,7 +46,7 @@ void setup_dma_rx()
 	dmaConfig.IRQMASK        = 0;  // disable interrupts
 	dmaConfig.TRIG           = 19; // radio
 	dmaConfig.TMODE          = 0;  // single byte mode
-	dmaConfig.WORDSIZE       = 0;  // one byte words;
+	dmaConfig.WORDSIZE       = 0;  // one byte words
 	dmaConfig.VLEN           = 0;  // use LEN
 	SET_WORD(dmaConfig.LENH, dmaConfig.LENL, LEN);
 
@@ -54,75 +60,190 @@ void setup_dma_rx()
 	return;
 }
 
+void set_intermediate_frequency(u32 freq) {
+	FSCTRL1 &= 0xE0;        // 0b11100000
+	FSCTRL0 &= 0x00;        // 0b00000000
+
+	// IF = XTAL / (2^10) * freq
+	// TODO convert to double/float
+	freq /= XTAL;
+	freq *= (2 << 10);
+	freq &= 0x0000001F;
+
+	// 0b...xxxxx
+	FSCTRL1 |= freq & 0x1F;
+}
+
+void set_modulation(modulation m) {
+	MDMCFG2 &= 0x8F;       // 0b1...1111
+	MDMCFG2 |= (m << 4);   // 0b.....xxx << 4
+}
+
+// dev is the desired deviation frequency in Hz
+void set_deviation(u32 dev) {
+	u8 M = 0, E = 0;
+
+	// Mask out the bits to clear
+	DEVIATN &= 0x88;       // 0b10001000
+
+	// This may not be an appropriate
+	// way to handle this division
+	// TODO convert to double/float?
+	// dev *= (2 << 17) / XTAL;
+	// TODO: Allow settings to change with XTAL freq
+	dev *= 0.00504123076923077;
+
+	// Calculate the exponent
+	while (dev >= (1 << 5)) {
+		dev >>= 1;
+		E++;
+	}
+
+	// Calculate the manissa
+	M = dev - 8;
+
+	// F_dev = XTAL / 2^17 * (8+M) * 2^E
+	// 0b.EEE.MMM
+	DEVIATN |= (E << 4) + (M);
+}
+
+void calibrate_freq_synth(void) {
+	// These values were copied. The documentation
+	// doesn't fully specify their behavior.
+	FSCAL3 = 0xEA;
+	FSCAL2 = 0x2A;
+	FSCAL1 = 0x00;
+	FSCAL0 = 0x1F;
+}
+
+void set_test_settings(void) {
+	// These values were copied. The documentation
+	// doesn't fully specify their behavior.
+	TEST2 = 0x88;
+	TEST1 = 0x31;
+	TEST0 = 0x09;
+}
+
+void config_radio_control(void) {
+	// Need to parameterize this one.
+
+	MCSM0 = 0x04; // Default, never automatically calibrate
+	MCSM1 = 0x3C; // Stay in RX
+	MCSM2 = 0x07; // Default, minimum RX timeout
+}
+
+void set_channel_spacing(u32 chan) {
+	u8 M = 0, E = 0;
+
+	MDMCFG1 &= 0xFC; // 0b11111100
+
+	// Channel spacing is (XTAL / 2^18) * (256 + M) * 2^E
+	chan = chan / (XTAL >> 18);
+	// TODO: divide this by the number of channels configured
+	// TODO: right now assume this value is 1
+
+	// Calculate the nessesary exponent
+	while (chan >= (1 << 9)) {
+		chan >>= 1;
+		E++;
+	}
+
+	// Calculate the nessesary mantissa
+	M = chan - 256;
+
+	MDMCFG0 =  M;       // 0bMMMMMMMM
+	MDMCFG1 |= E & 0x3; // 0b......EE
+}
+
+// Expected data rate in kbps
+void set_data_rate(u32 rate) {
+	u8 M = 0, E = 0;
+
+	MDMCFG4 &= 0xF0; // 0b11110000
+
+	// XTAL is assumed to be 26 MHz
+	// These calculations are wrong if it changes
+	// (10.32444... = 2^18 / 26000000)
+	rate = rate * 10.3244406153846;
+
+	// Calculate the correct exponent
+	while (rate >= (1 << 9)) {
+		rate >>= 1;
+		E++;
+	}
+
+	// Calculate the correct mantissa
+	M = rate - 256;
+
+	MDMCFG3 =  M;       // 0bMMMMMMMM
+	MDMCFG4 |= E & 0xF; // 0b....EEEE
+}
+
+void configure_packet_control(void) {
+	// TODO: parameterize this function
+	PKTCTRL0 = 0x02; // No data whitening, CRC off, infinite packet sizes
+	PKTCTRL1 = 0x04; // Default, preamble quality off, no ADDR check
+}
+
+void set_sync_word(u16 word, u8 on) {
+	// Split the word into two bytes
+        SYNC1 = ~((word >> 8) & 0xff);
+        SYNC0 = ~(word & 0xff);
+
+	// Turn the sync word detection on and off
+	// TODO: Give this the full granularity of the
+	// TODO: features of the chip (partial matchs)
+	MDMCFG2 &= 0xFD;               // 0b11111101
+	MDMCFG2 |= (on ? 2 : 0) & 0x2; // 0b......?.
+}
+
+void set_address(u8 addr) {
+	// Set the address, 0xFF and 0x00 are broadcast
+	// TODO: Support flags to toggle address checks
+	ADDR = addr;
+}
+
 void radio_setup() {
 	/* IF of 457.031 kHz */
-	FSCTRL1 = 0x12; // 18 * 26 MHz / 2^10
-	FSCTRL0 = 0x00; // This gets added, twos complement, zero = ignore
+	set_intermediate_frequency(457031);
 
 	/* disable 3 highest DVGA settings */
 	AGCCTRL2 |= AGCCTRL2_MAX_DVGA_GAIN;
 
 	/* frequency synthesizer calibration */
-	FSCAL3 = 0xEA;
-	FSCAL2 = 0x2A;
-	FSCAL1 = 0x00;
-	FSCAL0 = 0x1F;
+	calibrate_freq_synth();
 
 	/* "various test settings" */
-	TEST2 = 0x88;
-	TEST1 = 0x31;
-	TEST0 = 0x09;
+	set_test_settings();
 
 	/* radio control state machine */
-	MCSM0 = 0x04; // Default, never automatically calibrate
-	MCSM1 = 0x3C; // Stay in RX
-	MCSM2 = 0x07; // Default, minimum RX timeout
+	config_radio_control();
 
 	/* modem configuration */
-//	MDMCFG0 = 0xF8; // Default, 200 kHz channel spacing
-//	MDMCFG1 = 0x22; // Default, 4 preamble bytes for TX, FEC disabled
-	MDMCFG2 = 0x02; // Default, 2-FSK, 16/16 bit sync word detection
-//	MDMCFG3 = 0x22; // Default, data rate of 115.051 kbps
-//	MDMCFG4 = 0x8C; // Default, 203 kHz channel filter bandwidth
-//	MDMCFG4 = 0xFC; // ~58 kHz channel filter bandwidth
-
-	// This is to get a data rate of 1.6 kbps
-	MDMCFG3 = 0x02; // Data rate = ((256 + this)*2^that)/2^28 * XOSC
-	MDMCFG4 = 0xF6; // "that"
-	// ((256 + 2) * 2^6) / 2^28 * XOSC[26MHz] = 1.599 kHz
-	// Otherwise this is the same default values for bandwidth, etc
-
-	// This is to get a channel spacing of ~25 kHz, though I hear
-	// this is only for POGSAC and new FCC mandates 12.5 which
-	// the chip can't even be programmed for...
-	MDMCFG0 = 0x00; // chspacing = (XOSC>>18)*(256+this)*2^that*n_cha
-	MDMCFG1 = 0x00; // "that"
-	// (XOSC[26MHz]>>18)*(256)*2^0*1
-	// This also sets the preamble size to 2 (minimum)
-	// It's undetermined how exactly the num preamble affects RX
+	set_modulation(TWOFSK);
+	set_data_rate(1600);
+	set_channel_spacing(2500);
 
 	/* packet control configuraton */
-//	PKTCTRL0 = 0x42; // Data whitening, CRC off, infinite packet sizes
-	PKTCTRL0 = 0x02; // No data whitening, CRC off, infinite packet sizes
-	PKTCTRL1 = 0x04; // Default, preamble quality off, no ADDR check
+	configure_packet_control();
 
 	/* sync word configuration */
-	SYNC1 = ~(0xA6);
-	SYNC0 = ~(0xC6);
-	// Sync word for FLEX is 0xA6C6AAAA
+	set_sync_word(0xDEA0, 1);
+	// Look for 870C 5939 5555 DEA0
+	// This is  DEA0 A6C6 AAAA 870C but with bits flipped
+
+	/*
+	0x870C, 1600 baud, 2-FSK
+	0xB068, 1600 baud, 4-FSK
+	0xDEA0, 3200 baud, 4-FSK
+	0x4C7C, 3200 baud, 4-FSK
+	*/
 
 	/* address configuration */
-	ADDR = 0x00; // This is a test, assuming 0 = broadcast
+	set_address(0x00);
 
 	/* deviation settings */
-	// The deviation for the FSK modulation
-	DEVIATN = 0x14; // Aim at ~4800 Hz
-	// ((XOSC[26MHz] / 2^17) * (8 + LO_BYTE) * 2^HI_BYTE)
-	// ((XOSC[26MHz] / 2^17) * (8 + 4) * 2^1) == 4.76 kHz
-}
-
-/* set the channel bandwidth */
-void set_filter() {
+	set_deviation(1600);
 }
 
 /* set the radio frequency in Hz */
@@ -148,15 +269,11 @@ void setup_modulation() {
 }
 
 /* freq in Hz */
-void calibrate_freq(u32 freq, u8 ch) {
+void calibrate_freq(u32 freq, u8 chan) {
 	set_radio_freq(freq);
 
 	setup_modulation();
 }
-
-
-#define UPPER(a, b, c)  ((((a) - (b) + ((c) / 2)) / (c)) * (c))
-#define LOWER(a, b, c)  ((((a) + (b)) / (c)) * (c))
 
 void poll_keyboard() {
 	switch (getkey()) {
@@ -182,11 +299,41 @@ void rf_isr() __interrupt (RF_VECTOR) {
 	rxdone = 1;
 }
 
+u8 reverse(u8 b) {
+   b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+   b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+   b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+   return b;
+}
+
+/*
+	American Messaging
+	------------------
+	set_radio_freq(929937500); // 929.9375 MHz, 6400 baud, inverted, ABCD
+	set_radio_freq(931062500); // 931.0625 MHz, 6400 baud, inverted + Pog
+
+	Skytel
+	------
+	set_radio_freq(931937500); // 931.9375 MHz, 6400 baud, inverted, ABCD
+
+	USA Mobility
+	------------
+	set_radio_freq(929662500); // 929.6625 MHz, 6400 baud, inverted, ABCD
+	set_radio_freq(929587500); // 929.5875 MHz, 6400 baud, inverted, ABCD
+	set_radio_freq(929612500); // 929.6125 MHz, 3200 baud, inverted, AB
+	set_radio_freq(931212500); // 931.2125 MHz, 3200 baud, inverted, AB
+*/
+
 void main(void) {
-	u8 counter;
-	u8 i;
 	u8 ci;
 	u8 update = 1;
+	u8 state = 0;
+	u8 cycleno = 0;
+	u8 frameno = 0;
+	u32 fiw = 0;
+	u32 checksum = 0;
+	u8 line = 0;
+	u16 time = 0;
 
 	xtalClock();
 	setIOPorts();
@@ -194,8 +341,9 @@ void main(void) {
 	LCDReset();
 	setup_dma_rx();
 	radio_setup();
-	set_filter();
-	set_radio_freq(929612500); // 929.6125 MHz
+
+	set_radio_freq(929612500); // 929.6125 MHz, 3200 baud, inverted, AB
+
 	setup_modulation();
 
 	clear();
@@ -206,58 +354,82 @@ void main(void) {
 	SSN = HIGH;
 
 	while(1) {
-//		if (((update++)%2) == 0) {
-//			clear();
+		// Set DMA and radio interrupts
+		EA = 1;			// enable interrupts globally
+		IEN2 |= IEN2_RFIE;	// enable RF interrupt
+		RFIM = RFIM_IM_DONE;	// mask IRQ_DONE only
+		DMAARM |= DMAARM0;	// Arm DMA channel 0
 
-//		}
+		// Turn the radio on
+		//setup_modulation();
 
-
-//		sleepMillis(2);
-
-		EA = 1; // enable interrupts globally
-		IEN2 |= IEN2_RFIE; // enable RF interrupt
-		RFIM = RFIM_IM_DONE; // mask IRQ_DONE only
-		DMAARM |= DMAARM0;  // Arm DMA channel 0
-//    		RFST = RFST_SRX;
-//	        sleepMillis(1);
-
-		setup_modulation();
-
+		// Wait for the interrupt (which sets rxdone = 1)
 		while (!rxdone);
 		rxdone = 0;
 
-		SSN = LOW;
-		setCursor(0,0);
-		printf("RX: ");
-		for (ci = 0; ci < LEN; ci++) {
-	        	printf("%2X ", rxbuf[ci]);
+//		if (state == 1) {
+			// Print the incoming data
+
+//			break;
+//		}
+
+		if (state == 0 && rxbuf[0] == 0x59 && rxbuf[1] == 0x39 && rxbuf[2] == 0x55 && rxbuf[3] == 0x55 && rxbuf[4] == 0xDE && rxbuf[5] == 0xA0) {
+			SSN = LOW;
+			setCursor(0,0);
+			for (ci = 8; ci < LEN; ci++)
+				printf("%2x", rxbuf[ci] ^ 0xff);
+			setCursor(1,1);
+			for (ci = 8; ci < LEN; ci++)
+				printf("%2x", reverse(rxbuf[ci]));
+
+			fiw = 0;
+			//fiw |= reverse(rxbuf[11]) & 0x7F;
+			//fiw <<= 8;
+			//fiw |= reverse(rxbuf[10]);
+			//fiw <<= 8;
+			fiw |= reverse(rxbuf[ 9]);
+			fiw <<= 8;
+			fiw |= reverse(rxbuf[ 8]);
+
+			setCursor(2,2);
+			printf("%8x", fiw);
+			SSN = HIGH;
+
+/*			checksum = (fiw & 0xF);
+			checksum += ((fiw >> 4) & 0xF);
+			checksum += ((fiw >> 8) & 0xF);
+			checksum += ((fiw >> 12) & 0xF);
+			checksum += ((fiw >> 16) & 0xF);
+			checksum += ((fiw >> 20) & 0x01);
+
+			checksum &= 0xF;
+
+			if (checksum != 0xF) {*/
+				cycleno = (fiw >> 4) & 0xF;
+				frameno = (fiw >> 8) & 0x7F;
+				time = cycleno*4*60 + frameno*4*60/128;
+
+				SSN = LOW;
+				setCursor(3,3);
+				printf("%02u:%02u", time / 60, time % 60);
+		        	SSN = HIGH;
+//			}
+
+//			set_modulation(FOURFSK);
+//			set_deviation(4800);
+//			set_data_rate(3200);
+//			set_sync_word(0x00, 0);
+//			state = 1;
 		}
-//		setCursor(1,0);
-//		printf("MCSM2: %2x, ", MCSM2);
-        	SSN = HIGH;
-
-/*		for (ci = 0; ci < (LEN - 1); ci++) {
-			if (rxbuf[ci] == rxbuf[ci+1]) {
-				if (rxbuf[ci] == 0xAA || rxbuf[ci] == 0x55) {
-					clear();
-
-					SSN = LOW;
-					setCursor(0,0);
-					for (ci = 0; ci < LEN; ci++) {
-		        			printf("%02X", rxbuf[ci]);
-					}
-					SSN = HIGH;
-
-					break;
-				}
-			}
-		}*/
 
 		RFST = RFST_SIDLE;
+		RFST = RFST_SCAL;
+		RFST = RFST_SRX;
 
-
+		// Set the radio control state to idle
+		// TODO: this probably isn't needed
+		//RFST = RFST_SIDLE;
 	}
 
-	while(1) { }
-
+	while (1) {}
 }
