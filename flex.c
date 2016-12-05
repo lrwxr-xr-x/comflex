@@ -33,7 +33,7 @@ typedef enum { TWOFSK = 0, GFSK = 1, BLANK1 = 2, ONOFFKEY = 3, FOURFSK = 4, BLAN
 
 /* globals */
 __bit sleepy;
-static volatile u8 rxdone = 0;
+static volatile u8 rxdone = 0, timer1done = 0;
 __xdata DMA_DESC dmaConfig;
 
 #define LEN 12
@@ -48,6 +48,7 @@ void setup_dma_rx()
 	dmaConfig.TMODE          = 0;  // single byte mode
 	dmaConfig.WORDSIZE       = 0;  // one byte words
 	dmaConfig.VLEN           = 0;  // use LEN
+
 	SET_WORD(dmaConfig.LENH, dmaConfig.LENL, LEN);
 
 	SET_WORD(dmaConfig.SRCADDRH, dmaConfig.SRCADDRL, &X_RFD);
@@ -275,6 +276,85 @@ void calibrate_freq(u32 freq, u8 chan) {
 	setup_modulation();
 }
 
+/* Global timer configuration */
+void setup_global_timer_config(void) {
+	/* System Clock Configuration */
+	CLKCON &= 0xC7;	// 0b11000111
+	// this means system clock prescale set to 0.25
+	// one out of four ticks will register for timers
+	CLKCON |= 0x10; // 0b..010...
+
+	/* Timer 1 Configuration */
+	T1CTL &= 0xf2;  // 0b11110011
+	// Set the "div", prescale on sysclock
+	// '11' = one out of 128 ticks will increment
+	T1CTL |= 0x0C;
+	// Don't set the "mode" - mode of operation
+	// Setting the mode triggers the timer
+	// '10' = modulo the value in T1CC0
+	// T1CTL |= 0x02;
+
+	/* Interrupt flags */
+	IEN0 |= 0x80;
+	IEN1 |= 0x02;
+
+	T1CTL &= 0xEF;  // 0b...1....
+			// Turn off the flag
+	TIMIF |= 0x40;	// 0b.1......
+			// Turn on the overflow interrupt
+}
+
+void set_timer1(u16 ms) {
+	/* Set the interrupt flags */
+	IEN0 |= 0x80;
+	IEN1 |= 0x2;
+
+	T1CTL &= 0xEF;  // Turn off the interrupt flag
+	TIMIF |= 0x40;  // Turn on the interrupt mask
+
+	T1CNTL = 0;
+
+//	SSN = LOW;
+//	printf(" %x", T1CTL);
+//	SSN = HIGH;
+
+	// The following magic numbers come from...
+	// Timer1 will trigger when ms total increments
+	//  are reached. Each increment takes one unit
+	//  of (sysclock / sysprescale / timer prescale)
+
+	// We have configured sysprescale = 4 and
+	//  timer prescale to 128. The sysclock runs at
+	//  26 MHz. Therefore one unit of time for timer
+	//  increment is (26 MHz / 4 / 128) = 50.78 kHz
+
+	// Therefore 50.78 increments happen per ms
+
+	// The prescale values have been calculated so
+	// that the timer can trigger on a full second.
+	// It does not appear possible to configure the
+	// prescale values to wait minutes.
+
+	ms = (ms * 50.78);
+
+	T1CC0L = ms & 0xFF;
+	T1CC0H = (ms >> 8) & 0xFF;
+
+	T1CTL &= 0xEF;  // Turn off the interrupt flag
+	TIMIF |= 0x40;  // Turn on the interrupt mask
+
+	// Set Timer 1 control mode to modulus mode
+	T1CTL &= 0xFC; // 0b11111100
+	T1CTL |= 0x02;
+//	T1CTL |= 0x01; // 0b......10 - "10" = mod mode
+	// Setting the mode triggers the timer start
+
+//	SSN = LOW;
+//	printf(" %x", T1CTL);
+//	SSN = HIGH;
+
+}
+
 void poll_keyboard() {
 	switch (getkey()) {
 	case ' ':
@@ -297,6 +377,27 @@ void rf_isr() __interrupt (RF_VECTOR) {
 	S1CON &= ~0x03;           // Clear the general RFIF interrupt registers
 
 	rxdone = 1;
+}
+
+void t1_isr() __interrupt (T1_VECTOR) {
+//	SSN = LOW;
+//	printf("X");
+//	SSN = HIGH;
+
+	timer1done = 1;
+
+//	T1CTL = 0;
+//	TIMIF = 0; // 0b10111111 -> Turn mask off
+	T1CTL &= 0xEF; // 0b11101111 -> Turn flag off
+	TIMIF &= 0xBF; // 0b10111111 -> Turn mask off
+}
+
+void t2_isr() __interrupt (T2_VECTOR) {
+	t1_isr();
+}
+
+void t3_isr() __interrupt (T3_VECTOR) {
+	t1_isr();
 }
 
 u8 reverse(u8 b) {
@@ -327,24 +428,21 @@ u8 reverse(u8 b) {
 void main(void) {
 	u8 ci;
 	u8 update = 1;
-	u8 state = 0;
+	u16 state = 0;
 	u8 cycleno = 0;
 	u8 frameno = 0;
 	u32 fiw = 0;
 	u32 checksum = 0;
 	u8 line = 0;
 	u16 time = 0;
+	u8 countdown = 5;
+	u16 temp = 0;
 
 	xtalClock();
 	setIOPorts();
 	configureSPI();
+	setup_global_timer_config();
 	LCDReset();
-	setup_dma_rx();
-	radio_setup();
-
-	set_radio_freq(929612500); // 929.6125 MHz, 3200 baud, inverted, AB
-
-	setup_modulation();
 
 	clear();
 
@@ -353,82 +451,103 @@ void main(void) {
 	printf("Waiting...?");
 	SSN = HIGH;
 
+	setup_dma_rx();
+	radio_setup();
+	set_radio_freq(929612500); // 929.6125 MHz, 3200 baud, inverted, AB
+	setup_modulation();
+
 	while(1) {
-		// Set DMA and radio interrupts
-		EA = 1;			// enable interrupts globally
-		IEN2 |= IEN2_RFIE;	// enable RF interrupt
-		RFIM = RFIM_IM_DONE;	// mask IRQ_DONE only
-		DMAARM |= DMAARM0;	// Arm DMA channel 0
+		switch (state) {
+		case 0:
+		SSN = LOW;
+		setCursor(3,3);
+		printf("state: %u", 0);
+		SSN = HIGH;
+		// Sync1
+			// Set DMA and radio interrupts
+			EA = 1;			// enable interrupts globally
+			IEN2 |= IEN2_RFIE;	// enable RF interrupt
+			RFIM = RFIM_IM_DONE;	// mask IRQ_DONE only
+			DMAARM |= DMAARM0;	// Arm DMA channel 0
 
-		// Turn the radio on
-		//setup_modulation();
+			// Turn the radio on
+			setup_modulation();
 
-		// Wait for the interrupt (which sets rxdone = 1)
-		while (!rxdone);
-		rxdone = 0;
+			// Wait for the interrupt (which sets rxdone = 1)
+			while (!rxdone);
+			rxdone = 0;
+			RFST = RFST_SIDLE;
 
-//		if (state == 1) {
-			// Print the incoming data
+			if (state == 0 && rxbuf[0] == 0x59 && rxbuf[1] == 0x39 && rxbuf[2] == 0x55 && rxbuf[3] == 0x55 && rxbuf[4] == 0xDE && rxbuf[5] == 0xA0) {
+				fiw = 0;
+				fiw |= reverse(rxbuf[9]);
+				fiw <<= 8;
+				fiw |= reverse(rxbuf[8]);
 
-//			break;
-//		}
-
-		if (state == 0 && rxbuf[0] == 0x59 && rxbuf[1] == 0x39 && rxbuf[2] == 0x55 && rxbuf[3] == 0x55 && rxbuf[4] == 0xDE && rxbuf[5] == 0xA0) {
-			SSN = LOW;
-			setCursor(0,0);
-			for (ci = 8; ci < LEN; ci++)
-				printf("%2x", rxbuf[ci] ^ 0xff);
-			setCursor(1,1);
-			for (ci = 8; ci < LEN; ci++)
-				printf("%2x", reverse(rxbuf[ci]));
-
-			fiw = 0;
-			//fiw |= reverse(rxbuf[11]) & 0x7F;
-			//fiw <<= 8;
-			//fiw |= reverse(rxbuf[10]);
-			//fiw <<= 8;
-			fiw |= reverse(rxbuf[ 9]);
-			fiw <<= 8;
-			fiw |= reverse(rxbuf[ 8]);
-
-			setCursor(2,2);
-			printf("%8x", fiw);
-			SSN = HIGH;
-
-/*			checksum = (fiw & 0xF);
-			checksum += ((fiw >> 4) & 0xF);
-			checksum += ((fiw >> 8) & 0xF);
-			checksum += ((fiw >> 12) & 0xF);
-			checksum += ((fiw >> 16) & 0xF);
-			checksum += ((fiw >> 20) & 0x01);
-
-			checksum &= 0xF;
-
-			if (checksum != 0xF) {*/
 				cycleno = (fiw >> 4) & 0xF;
 				frameno = (fiw >> 8) & 0x7F;
 				time = cycleno*4*60 + frameno*4*60/128;
 
 				SSN = LOW;
-				setCursor(3,3);
+				setCursor(0,0);
 				printf("%02u:%02u", time / 60, time % 60);
-		        	SSN = HIGH;
-//			}
+	       		 	SSN = HIGH;
 
-//			set_modulation(FOURFSK);
-//			set_deviation(4800);
-//			set_data_rate(3200);
-//			set_sync_word(0x00, 0);
-//			state = 1;
+				state = 1;
+
+				set_timer1(25); // 25 ms wait over Sync2
+			}
+		break;
+
+		case 1:
+		SSN = LOW;
+		setCursor(3,3);
+		printf("state: %u", 1);
+		SSN = HIGH;
+		// Pause over Sync2
+			while (!timer1done) { }
+			timer1done = 0;
+			state = 2;
+		break;
+
+		case 2:
+		SSN = LOW;
+		setCursor(3,3);
+		printf("state: %u", 2);
+		SSN = HIGH;
+		// Get a data frame
+			set_modulation(FOURFSK);
+			set_deviation(4800);
+			set_data_rate(3200);
+			set_sync_word(0x00, 0);
+
+			RFST = RFST_SCAL;
+			RFST = RFST_SRX;
+
+			EA = 1;			// enable interrupts globally
+			IEN2 |= IEN2_RFIE;	// enable RF interrupt
+			RFIM = RFIM_IM_DONE;	// mask IRQ_DONE only
+			DMAARM |= DMAARM0;	// Arm DMA channel 0
+
+			while (!rxdone) { }
+			rxdone = 0;
+			RFST = RFST_SIDLE;
+
+			SSN = LOW;
+			setCursor(1,1);
+			for (ci = 0; ci < LEN; ci++) {
+				printf("%2x", rxbuf[ci]);
+			}
+			SSN = HIGH;
+
+			radio_setup();
+
+			RFST = RFST_SCAL;
+			RFST = RFST_SRX;
+
+			state = 0;
+		break;
 		}
-
-		RFST = RFST_SIDLE;
-		RFST = RFST_SCAL;
-		RFST = RFST_SRX;
-
-		// Set the radio control state to idle
-		// TODO: this probably isn't needed
-		//RFST = RFST_SIDLE;
 	}
 
 	while (1) {}
