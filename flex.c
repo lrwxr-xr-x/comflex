@@ -39,7 +39,10 @@ __xdata DMA_DESC dmaConfig;
 #define LEN 12
 __xdata u8 rxbuf[LEN];
 
-void setup_dma_rx()
+__xdata u8 page_buffer[4*11*8*4]; // 4 phases, 11 blocks, 8 codewords, 32 bits
+__xdata u8 page[4][11*8*4]; // 2 phases, 11 blocks, 8 codewords, 32 bits
+
+void setup_dma_rx(u8* dest, u16 len)
 {
 	dmaConfig.PRIORITY       = 2;  // high priority
 	dmaConfig.M8             = 0;  // not applicable
@@ -49,10 +52,10 @@ void setup_dma_rx()
 	dmaConfig.WORDSIZE       = 0;  // one byte words
 	dmaConfig.VLEN           = 0;  // use LEN
 
-	SET_WORD(dmaConfig.LENH, dmaConfig.LENL, LEN);
+	SET_WORD(dmaConfig.LENH, dmaConfig.LENL, len);
 
 	SET_WORD(dmaConfig.SRCADDRH, dmaConfig.SRCADDRL, &X_RFD);
-	SET_WORD(dmaConfig.DESTADDRH, dmaConfig.DESTADDRL, rxbuf);
+	SET_WORD(dmaConfig.DESTADDRH, dmaConfig.DESTADDRL, (u16)dest);
 	dmaConfig.SRCINC         = 0;  // do not increment
 	dmaConfig.DESTINC        = 1;  // increment by one
 
@@ -164,12 +167,14 @@ void set_data_rate(u32 rate) {
 
 	// XTAL is assumed to be 26 MHz
 	// These calculations are wrong if it changes
-	// (10.32444... = 2^18 / 26000000)
+	// (10.32444... = 2^28 / 26000000)
 	rate = rate * 10.3244406153846;
 
+	// rate = (256 + M) * 2^E
+
 	// Calculate the correct exponent
-	while (rate >= (1 << 9)) {
-		rate >>= 1;
+	while (rate >= 512) { // Maximum possible value
+		rate /= 2;
 		E++;
 	}
 
@@ -304,7 +309,7 @@ void setup_global_timer_config(void) {
 			// Turn on the overflow interrupt
 }
 
-void set_timer1(u16 ms) {
+void set_timer1(u16 ms, u16 us) {
 	/* Set the interrupt flags */
 	IEN0 |= 0x80;
 	IEN1 |= 0x2;
@@ -336,6 +341,8 @@ void set_timer1(u16 ms) {
 	// prescale values to wait minutes.
 
 	ms = (ms * 50.78);
+	us = (us * .05078);
+	ms = ms + us;
 
 	T1CC0L = ms & 0xFF;
 	T1CC0H = (ms >> 8) & 0xFF;
@@ -407,6 +414,27 @@ u8 reverse(u8 b) {
    return b;
 }
 
+u8 fix(u8 val) {
+	u8 a, b, c, d;
+	a = (val >> 6) & 3;
+	b = (val >> 4) & 3;
+	c = (val >> 2) & 3;
+	d = (val >> 0) & 3;
+
+	if (a < 2) a ^= 1;
+	if (b < 2) b ^= 1;
+	if (c < 2) c ^= 1;
+	if (d < 2) d ^= 1;
+
+//	a = 3 - a;
+//	b = 3 - b;
+//	c = 3 - c;
+//	d = 3 - d;
+
+	val = (a << 6) + (b << 4) + (c << 2) + (d << 0);
+	return val;
+}
+
 /*
 	American Messaging
 	------------------
@@ -426,7 +454,7 @@ u8 reverse(u8 b) {
 */
 
 void main(void) {
-	u8 ci;
+	u16 ci;
 	u8 update = 1;
 	u16 state = 0;
 	u8 cycleno = 0;
@@ -437,6 +465,22 @@ void main(void) {
 	u16 time = 0;
 	u8 countdown = 5;
 	u16 temp = 0;
+	u8 col = 0;
+	u8 block = 0;
+	u8 bit = 0;
+	u8 sb = 0;
+	u8 biw;
+	u8 voffset;
+	u8 aoffset;
+	u16 capcode;
+	u8 bita = 0;
+	u8 bitb = 0;
+	u8 toggle = 0;
+	u8 index = 0;
+	u16 count = 0;
+	u8 lcount = 0;
+	u8 hcount = 0;
+	u8 timerdown = 0;
 
 	xtalClock();
 	setIOPorts();
@@ -451,18 +495,19 @@ void main(void) {
 	printf("Waiting...?");
 	SSN = HIGH;
 
-	setup_dma_rx();
+	setup_dma_rx(rxbuf, LEN);
 	radio_setup();
 	set_radio_freq(929612500); // 929.6125 MHz, 3200 baud, inverted, AB
 	setup_modulation();
 
 	while(1) {
-		switch (state) {
-		case 0:
 		SSN = LOW;
 		setCursor(3,3);
 		printf("state: %u", 0);
 		SSN = HIGH;
+
+		switch (state) {
+		case 0:
 		// Sync1
 			// Set DMA and radio interrupts
 			EA = 1;			// enable interrupts globally
@@ -477,33 +522,37 @@ void main(void) {
 			while (!rxdone);
 			rxdone = 0;
 			RFST = RFST_SIDLE;
+//			RFST = RFST_SCAL;
+			RFST = RFST_SRX;
 
-			if (state == 0 && rxbuf[0] == 0x59 && rxbuf[1] == 0x39 && rxbuf[2] == 0x55 && rxbuf[3] == 0x55 && rxbuf[4] == 0xDE && rxbuf[5] == 0xA0) {
-				fiw = 0;
-				fiw |= reverse(rxbuf[9]);
-				fiw <<= 8;
-				fiw |= reverse(rxbuf[8]);
+			if (rxbuf[0] == 0x59 && rxbuf[1] == 0x39 && rxbuf[2] == 0x55 && rxbuf[3] == 0x55 && rxbuf[4] == 0xDE && rxbuf[5] == 0xA0) {
+//				fiw = 0;
+//				fiw |= reverse(rxbuf[9]);
+//				fiw <<= 8;
+//				fiw |= reverse(rxbuf[8]);
 
-				cycleno = (fiw >> 4) & 0xF;
+/*				cycleno = (fiw >> 4) & 0xF;
 				frameno = (fiw >> 8) & 0x7F;
 				time = cycleno*4*60 + frameno*4*60/128;
 
 				SSN = LOW;
 				setCursor(0,0);
 				printf("%02u:%02u", time / 60, time % 60);
-	       		 	SSN = HIGH;
+	       		 	SSN = HIGH;*/
 
 				state = 1;
-
-				set_timer1(25); // 25 ms wait over Sync2
+// Look at 28 is real val
+				set_timer1(5, 104+(312.5 * 20)); // 25 ms wait over Sync2
+							// 25 ms / 80 symbols is one symbol
+							// per 312.5 microseconds
 			}
 		break;
 
 		case 1:
-		SSN = LOW;
-		setCursor(3,3);
-		printf("state: %u", 1);
-		SSN = HIGH;
+//		SSN = LOW;
+//		setCursor(3,3);
+//		printf("state: %u", 1);
+//		SSN = HIGH;
 		// Pause over Sync2
 			while (!timer1done) { }
 			timer1done = 0;
@@ -511,18 +560,20 @@ void main(void) {
 		break;
 
 		case 2:
-		SSN = LOW;
-		setCursor(3,3);
-		printf("state: %u", 2);
-		SSN = HIGH;
+//		SSN = LOW;
+//		setCursor(3,3);
+//		printf("state: %u", 2);
+//		SSN = HIGH;
 		// Get a data frame
 			set_modulation(FOURFSK);
 			set_deviation(4800);
-			set_data_rate(3200);
-			set_sync_word(0x00, 0);
+			set_data_rate(3200);	// Data rate = bps or baud?
+						// Assuming it is baud
+			set_sync_word(0x0000, 0);
 
-			RFST = RFST_SCAL;
-			RFST = RFST_SRX;
+		        SET_WORD(dmaConfig.LENH, dmaConfig.LENL, 40);//4*11*8*4);
+		        SET_WORD(dmaConfig.DESTADDRH, dmaConfig.DESTADDRL, (u16)page_buffer);
+//			setup_dma_rx(page_buffer, 40);
 
 			EA = 1;			// enable interrupts globally
 			IEN2 |= IEN2_RFIE;	// enable RF interrupt
@@ -533,19 +584,134 @@ void main(void) {
 			rxdone = 0;
 			RFST = RFST_SIDLE;
 
-			SSN = LOW;
-			setCursor(1,1);
-			for (ci = 0; ci < LEN; ci++) {
-				printf("%2x", rxbuf[ci]);
+			state = 3;
+
+			timerdown = 0;
+		break;
+
+		case 3:
+		// Deinterleave and decode
+			ci = 0;
+			sb = 6;
+			count = 0;
+			lcount = 0;
+			hcount = 0;
+			toggle = 0;
+
+			for (ci = 0; ci < (4*11*8*4); ci++) {
+			page_buffer[ci] = fix(page_buffer[ci]);
+			for (sb = 6; sb >= 0 && sb <= 6; sb-=2) {
+				temp = page_buffer[ci];
+				temp = temp >> sb;
+				temp = temp & 0x3;
+//				temp = temp ^ 0x3;
+
+				if (temp > 1) bita = 1;
+				else bita = 0;
+
+				if (temp == 1 || temp == 2) bitb = 1;
+				else bitb = 0;
+
+				index = ((count>>5)&0xFFF8) | (count&0x0007);
+				index = index * 4;
+
+				if (toggle == 0) {
+					page[0][index+3-lcount] = page[0][index+3-lcount] & ~(1 << hcount);
+					page[0][index+3-lcount] = page[0][index+3-lcount] | ((bita) << hcount);
+					page[1][index+3-lcount] = page[1][index+3-lcount] & ~(1 << hcount);
+					page[1][index+3-lcount] = page[1][index+3-lcount] | ((bitb) << hcount);
+				} else {
+					page[2][index+3-lcount] = page[2][index+3-lcount] & ~(1 << hcount);
+					page[2][index+3-lcount] = page[2][index+3-lcount] | ((bita) << hcount);
+					page[3][index+3-lcount] = page[3][index+3-lcount] & ~(1 << hcount);
+					page[3][index+3-lcount] = page[3][index+3-lcount] | ((bitb) << hcount);
+				}
+
+				toggle = (toggle == 1) ? 0 : 1;
+
+				if (toggle == 0) {
+					count++;
+
+					if ((count % 8) == 0) {
+						hcount++;
+						if (hcount == 8) { hcount = 0; lcount++; }
+						if (lcount == 4) { lcount = 0; }
+					}
+				}
+
 			}
+			}
+
+/*			for (block = 0; block < 11; block++) {
+				for (bit = 0; bit < 8; bit++) {
+					page[0][block][bit][0] = page[0][block][bit][1] = page[0][block][bit][2] = page[0][block][bit][3] = 0;
+					page[1][block][bit][0] = page[1][block][bit][1] = page[1][block][bit][2] = page[1][block][bit][3] = 0;
+				}
+				for (col = 0; col < 32; col++) {
+					for (bit = 0; bit < 8; bit++) {
+						temp = page_buffer[ci];
+						temp >>= sb;
+						temp &= 0x03;
+
+						if (sb > 0) sb -= 2;
+						else { sb = 6; ci++; }
+
+						page[0][block][bit][(col-(col%8))/8] |= ((temp & 0x02) ? 1 : 0) << (7 - (col%8));
+						page[1][block][bit][(col-(col%8))/8] |= ((temp & 0x01) ? 1 : 0) << (7 - (col%8));
+					}
+				}
+			}*/
+
+			SSN = LOW;
+			setCursor(6,6);
+			printf("Raw: %2x%2x%2x%2x", page_buffer[timerdown+0], page_buffer[timerdown+1], page_buffer[timerdown+2], page_buffer[timerdown+3]);
+			setCursor(5,5);
+			printf("Int: %2x%2x%2x%2x", page[0][timerdown+0], page[0][timerdown+1], page[0][timerdown+2], page[0][timerdown+3]);
 			SSN = HIGH;
 
+			set_timer1(1000, 0);
+
+			while (!timer1done) { }
+			timer1done = 0;
+
+			set_timer1(1000, 0);
+
+			while (!timer1done) { }
+			timer1done = 0;
+
+			set_timer1(1000, 0);
+
+			while (!timer1done) { }
+			timer1done = 0;
+
+			timerdown+=4;
+
+			if (timerdown == 20) {
+/*
+			biw = page[0][0][0][0];
+
+			voffset = (biw >> 2) & 0x3f;
+			aoffset = (biw & 0x03) + 1;
+
+			// Iterate through pages and dispatch to appropriate handler
+			for (ci = aoffset; ci < voffset; ci++) {
+				capcode = page[0][(ci - (ci%8))/8][ci%8][2];
+				capcode <<= 8;
+				capcode |= page[0][(ci - (ci%8))/8][ci%8][3];
+				SSN = LOW;
+				setCursor(5,5);
+				printf("B%2x A%2x V%2x C%2x", biw, aoffset, voffset, capcode);
+				SSN = HIGH;
+			}*/
+
+			setup_dma_rx(rxbuf, LEN);
 			radio_setup();
 
 			RFST = RFST_SCAL;
 			RFST = RFST_SRX;
 
 			state = 0;
+			}
 		break;
 		}
 	}
